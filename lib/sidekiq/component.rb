@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module Sidekiq
   ##
   # Sidekiq::Component assumes a config instance is available at @config
@@ -47,8 +49,10 @@ module Sidekiq
     end
 
     def fire_event(event, options = {})
+      oneshot = options.fetch(:oneshot, true)
       reverse = options[:reverse]
       reraise = options[:reraise]
+      logger.debug("Firing #{event} event") if oneshot
 
       arr = config[:lifecycle_events][event]
       arr.reverse! if reverse
@@ -58,7 +62,7 @@ module Sidekiq
         handle_exception(ex, {context: "Exception during Sidekiq lifecycle event.", event: event})
         raise ex if reraise
       end
-      arr.clear # once we've fired an event, we never fire it again
+      arr.clear if oneshot # once we've fired an event, we never fire it again
     end
   end
 end

@@ -30,7 +30,8 @@ module Sidekiq
       "Queues" => "queues",
       "Retries" => "retries",
       "Scheduled" => "scheduled",
-      "Dead" => "morgue"
+      "Dead" => "morgue",
+      "Metrics" => "metrics"
     }
 
     class << self
@@ -46,6 +47,10 @@ module Sidekiq
         @custom_tabs ||= {}
       end
       alias_method :tabs, :custom_tabs
+
+      def custom_job_info_rows
+        @custom_job_info_rows ||= []
+      end
 
       def locales
         @locales ||= LOCALES
@@ -73,14 +78,6 @@ module Sidekiq
 
       def set(attribute, value)
         send(:"#{attribute}=", value)
-      end
-
-      def sessions=(val)
-        puts "WARNING: Sidekiq::Web.sessions= is no longer relevant and will be removed in Sidekiq 7.0. #{caller(1..1).first}"
-      end
-
-      def session_secret=(val)
-        puts "WARNING: Sidekiq::Web.session_secret= is no longer relevant and will be removed in Sidekiq 7.0. #{caller(1..1).first}"
       end
 
       attr_accessor :app_url, :redis_pool
@@ -129,10 +126,6 @@ module Sidekiq
       send(:"#{attribute}=", value)
     end
 
-    def sessions=(val)
-      puts "Sidekiq::Web#sessions= is no longer relevant and will be removed in Sidekiq 7.0. #{caller[2..2].first}"
-    end
-
     def self.register(extension)
       extension.registered(WebApplication)
     end
@@ -144,7 +137,7 @@ module Sidekiq
       m = middlewares
 
       rules = []
-      rules = [[:all, {"Cache-Control" => "public, max-age=86400"}]] unless ENV["SIDEKIQ_WEB_TESTING"]
+      rules = [[:all, {"cache-control" => "public, max-age=86400"}]] unless ENV["SIDEKIQ_WEB_TESTING"]
 
       ::Rack::Builder.new do
         use Rack::Static, urls: ["/stylesheets", "/images", "/javascripts"],

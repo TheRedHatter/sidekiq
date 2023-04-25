@@ -17,18 +17,23 @@ module Sidekiq
 
     def verify_json(item)
       job_class = item["wrapped"] || item["class"]
-      if Sidekiq[:on_complex_arguments] == :raise
-        msg = <<~EOM
-          Job arguments to #{job_class} must be native JSON types, see https://github.com/mperham/sidekiq/wiki/Best-Practices.
-          To disable this error, remove `Sidekiq.strict_args!` from your initializer.
-        EOM
-        raise(ArgumentError, msg) unless json_safe?(item)
-      elsif Sidekiq[:on_complex_arguments] == :warn
-        Sidekiq.logger.warn <<~EOM unless json_safe?(item)
-          Job arguments to #{job_class} do not serialize to JSON safely. This will raise an error in
-          Sidekiq 7.0. See https://github.com/mperham/sidekiq/wiki/Best-Practices or raise an error today
-          by calling `Sidekiq.strict_args!` during Sidekiq initialization.
-        EOM
+      args = item["args"]
+      mode = Sidekiq::Config::DEFAULTS[:on_complex_arguments]
+
+      if mode == :raise || mode == :warn
+        if (unsafe_item = json_unsafe?(args))
+          msg = <<~EOM
+            Job arguments to #{job_class} must be native JSON types, but #{unsafe_item.inspect} is a #{unsafe_item.class}.
+            See https://github.com/sidekiq/sidekiq/wiki/Best-Practices
+            To disable this error, add `Sidekiq.strict_args!(false)` to your initializer.
+          EOM
+
+          if mode == :raise
+            raise(ArgumentError, msg)
+          else
+            warn(msg)
+          end
+        end
       end
     end
 
@@ -64,8 +69,37 @@ module Sidekiq
 
     private
 
-    def json_safe?(item)
-      JSON.parse(JSON.dump(item["args"])) == item["args"]
+    RECURSIVE_JSON_UNSAFE = {
+      Integer => ->(val) {},
+      Float => ->(val) {},
+      TrueClass => ->(val) {},
+      FalseClass => ->(val) {},
+      NilClass => ->(val) {},
+      String => ->(val) {},
+      Array => ->(val) {
+        val.each do |e|
+          unsafe_item = RECURSIVE_JSON_UNSAFE[e.class].call(e)
+          return unsafe_item unless unsafe_item.nil?
+        end
+        nil
+      },
+      Hash => ->(val) {
+        val.each do |k, v|
+          return k unless String === k
+
+          unsafe_item = RECURSIVE_JSON_UNSAFE[v.class].call(v)
+          return unsafe_item unless unsafe_item.nil?
+        end
+        nil
+      }
+    }
+
+    RECURSIVE_JSON_UNSAFE.default = ->(val) { val }
+    RECURSIVE_JSON_UNSAFE.compare_by_identity
+    private_constant :RECURSIVE_JSON_UNSAFE
+
+    def json_unsafe?(item)
+      RECURSIVE_JSON_UNSAFE[item.class].call(item)
     end
   end
 end

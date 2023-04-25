@@ -1,10 +1,8 @@
 # frozen_string_literal: true
 
-require "sidekiq/scheduled"
-require "sidekiq/api"
-
 require "zlib"
 require "base64"
+require "sidekiq/component"
 
 module Sidekiq
   ##
@@ -51,7 +49,7 @@ module Sidekiq
   # The default number of retries is 25 which works out to about 3 weeks
   # You can change the default maximum number of retries in your initializer:
   #
-  #   Sidekiq.options[:max_retries] = 7
+  #   Sidekiq.default_configuration[:max_retries] = 7
   #
   # or limit the number of retries for a particular job and send retries to
   # a low priority queue with:
@@ -70,9 +68,9 @@ module Sidekiq
 
     DEFAULT_MAX_RETRY_ATTEMPTS = 25
 
-    def initialize(options)
-      @config = options
-      @max_retries = @config[:max_retries] || DEFAULT_MAX_RETRY_ATTEMPTS
+    def initialize(capsule)
+      @config = @capsule = capsule
+      @max_retries = Sidekiq.default_configuration[:max_retries] || DEFAULT_MAX_RETRY_ATTEMPTS
     end
 
     # The global retry handler requires only the barest of data.
@@ -91,9 +89,9 @@ module Sidekiq
 
       msg = Sidekiq.load_json(jobstr)
       if msg["retry"]
-        attempt_retry(nil, msg, queue, e)
+        process_retry(nil, msg, queue, e)
       else
-        Sidekiq.death_handlers.each do |handler|
+        @capsule.config.death_handlers.each do |handler|
           handler.call(msg, e)
         rescue => handler_ex
           handle_exception(handler_ex, {context: "Error calling death handler", job: msg})
@@ -128,7 +126,7 @@ module Sidekiq
       end
 
       raise e unless msg["retry"]
-      attempt_retry(jobinst, msg, queue, e)
+      process_retry(jobinst, msg, queue, e)
       # We've handled this error associated with this job, don't
       # need to handle it at the global level
       raise Skip
@@ -139,7 +137,7 @@ module Sidekiq
     # Note that +jobinst+ can be nil here if an error is raised before we can
     # instantiate the job instance.  All access must be guarded and
     # best effort.
-    def attempt_retry(jobinst, msg, queue, exception)
+    def process_retry(jobinst, msg, queue, exception)
       max_retry_attempts = retry_attempts_from(msg["retry"], @max_retries)
 
       msg["queue"] = (msg["retry_queue"] || queue)
@@ -170,19 +168,50 @@ module Sidekiq
         msg["error_backtrace"] = compress_backtrace(lines)
       end
 
-      if count < max_retry_attempts
-        delay = delay_for(jobinst, count, exception)
-        # Logging here can break retries if the logging device raises ENOSPC #3979
-        # logger.debug { "Failure! Retry #{count} in #{delay} seconds" }
-        retry_at = Time.now.to_f + delay
-        payload = Sidekiq.dump_json(msg)
-        redis do |conn|
-          conn.zadd("retry", retry_at.to_s, payload)
-        end
-      else
-        # Goodbye dear message, you (re)tried your best I'm sure.
-        retries_exhausted(jobinst, msg, exception)
+      # Goodbye dear message, you (re)tried your best I'm sure.
+      return retries_exhausted(jobinst, msg, exception) if count >= max_retry_attempts
+
+      strategy, delay = delay_for(jobinst, count, exception, msg)
+      case strategy
+      when :discard
+        return # poof!
+      when :kill
+        return retries_exhausted(jobinst, msg, exception)
       end
+
+      # Logging here can break retries if the logging device raises ENOSPC #3979
+      # logger.debug { "Failure! Retry #{count} in #{delay} seconds" }
+      jitter = rand(10) * (count + 1)
+      retry_at = Time.now.to_f + delay + jitter
+      payload = Sidekiq.dump_json(msg)
+      redis do |conn|
+        conn.zadd("retry", retry_at.to_s, payload)
+      end
+    end
+
+    # returns (strategy, seconds)
+    def delay_for(jobinst, count, exception, msg)
+      rv = begin
+        # sidekiq_retry_in can return two different things:
+        # 1. When to retry next, as an integer of seconds
+        # 2. A symbol which re-routes the job elsewhere, e.g. :discard, :kill, :default
+        jobinst&.sidekiq_retry_in_block&.call(count, exception, msg)
+      rescue Exception => e
+        handle_exception(e, {context: "Failure scheduling retry using the defined `sidekiq_retry_in` in #{jobinst.class.name}, falling back to default"})
+        nil
+      end
+
+      rv = rv.to_i if rv.respond_to?(:to_i)
+      delay = (count**4) + 15
+      if Integer === rv && rv > 0
+        delay = rv
+      elsif rv == :discard
+        return [:discard, nil] # do nothing, job goes poof
+      elsif rv == :kill
+        return [:kill, nil]
+      end
+
+      [:default, delay]
     end
 
     def retries_exhausted(jobinst, msg, exception)
@@ -195,7 +224,7 @@ module Sidekiq
 
       send_to_morgue(msg) unless msg["dead"] == false
 
-      config.death_handlers.each do |handler|
+      @capsule.config.death_handlers.each do |handler|
         handler.call(msg, exception)
       rescue => e
         handle_exception(e, {context: "Error calling death handler", job: msg})
@@ -205,7 +234,15 @@ module Sidekiq
     def send_to_morgue(msg)
       logger.info { "Adding dead #{msg["class"]} job #{msg["jid"]}" }
       payload = Sidekiq.dump_json(msg)
-      DeadSet.new.kill(payload, notify_failure: false)
+      now = Time.now.to_f
+
+      redis do |conn|
+        conn.multi do |xa|
+          xa.zadd("dead", now.to_s, payload)
+          xa.zremrangebyscore("dead", "-inf", now - @capsule.config[:dead_timeout_in_seconds])
+          xa.zremrangebyrank("dead", 0, - @capsule.config[:dead_max_jobs])
+        end
+      end
     end
 
     def retry_attempts_from(msg_retry, default)
@@ -214,22 +251,6 @@ module Sidekiq
       else
         default
       end
-    end
-
-    def delay_for(jobinst, count, exception)
-      jitter = rand(10) * (count + 1)
-      if jobinst&.sidekiq_retry_in_block
-        custom_retry_in = retry_in(jobinst, count, exception).to_i
-        return custom_retry_in + jitter if custom_retry_in > 0
-      end
-      (count**4) + 15 + jitter
-    end
-
-    def retry_in(jobinst, count, exception)
-      jobinst.sidekiq_retry_in_block.call(count, exception)
-    rescue Exception => e
-      handle_exception(e, {context: "Failure scheduling retry using the defined `sidekiq_retry_in` in #{jobinst.class.name}, falling back to default"})
-      nil
     end
 
     def exception_caused_by_shutdown?(e, checked_causes = [])

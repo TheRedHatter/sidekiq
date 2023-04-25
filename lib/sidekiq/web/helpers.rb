@@ -15,7 +15,7 @@ module Sidekiq
       # so extensions can be localized
       @strings[lang] ||= settings.locales.each_with_object({}) do |path, global|
         find_locale_files(lang).each do |file|
-          strs = YAML.load(File.open(file))
+          strs = YAML.safe_load(File.read(file))
           global.merge!(strs[lang])
         end
       end
@@ -118,7 +118,7 @@ module Sidekiq
       }.join(" ")
     end
 
-    # mperham/sidekiq#3243
+    # sidekiq/sidekiq#3243
     def unfiltered?
       yield unless env["PATH_INFO"].start_with?("/filter/")
     end
@@ -137,7 +137,7 @@ module Sidekiq
     end
 
     def sort_direction_label
-      params[:direction] == "asc" ? "&uarr;" : "&darr;"
+      (params[:direction] == "asc") ? "&uarr;" : "&darr;"
     end
 
     def workset
@@ -148,22 +148,39 @@ module Sidekiq
       @processes ||= Sidekiq::ProcessSet.new
     end
 
+    # Sorts processes by hostname following the natural sort order
+    def sorted_processes
+      @sorted_processes ||= begin
+        return processes unless processes.all? { |p| p["hostname"] }
+
+        processes.to_a.sort_by do |process|
+          # Kudos to `shurikk` on StackOverflow
+          # https://stackoverflow.com/a/15170063/575547
+          process["hostname"].split(/(\d+)/).map { |a| /\d+/.match?(a) ? a.to_i : a }
+        end
+      end
+    end
+
+    def busy_weights(capsule_weights)
+      # backwards compat with 7.0.0, remove in 7.1
+      cw = [capsule_weights].flatten
+      cw.map { |hash|
+        hash.map { |name, weight| (weight > 0) ? +name << ": " << weight.to_s : name }.join(", ")
+      }.join("; ")
+    end
+
     def stats
       @stats ||= Sidekiq::Stats.new
     end
 
-    def redis_connection
+    def redis_url
       Sidekiq.redis do |conn|
-        conn.connection[:id]
+        conn.config.server_url
       end
     end
 
-    def namespace
-      @ns ||= Sidekiq.redis { |conn| conn.respond_to?(:namespace) ? conn.namespace : nil }
-    end
-
     def redis_info
-      Sidekiq.redis_info
+      Sidekiq.default_configuration.redis_info
     end
 
     def root_path
@@ -175,7 +192,7 @@ module Sidekiq
     end
 
     def current_status
-      workset.size == 0 ? "idle" : "active"
+      (workset.size == 0) ? "idle" : "active"
     end
 
     def relative_time(time)
@@ -208,7 +225,7 @@ module Sidekiq
     end
 
     def truncate(text, truncate_after_chars = 2000)
-      truncate_after_chars && text.size > truncate_after_chars ? "#{text[0..truncate_after_chars]}..." : text
+      (truncate_after_chars && text.size > truncate_after_chars) ? "#{text[0..truncate_after_chars]}..." : text
     end
 
     def display_args(args, truncate_after_chars = 2000)
@@ -301,7 +318,7 @@ module Sidekiq
     end
 
     def environment_title_prefix
-      environment = Sidekiq[:environment] || ENV["APP_ENV"] || ENV["RAILS_ENV"] || ENV["RACK_ENV"] || "development"
+      environment = Sidekiq.default_configuration[:environment] || ENV["APP_ENV"] || ENV["RAILS_ENV"] || ENV["RACK_ENV"] || "development"
 
       "[#{environment.upcase}] " unless environment == "production"
     end
@@ -314,11 +331,8 @@ module Sidekiq
       Time.now.utc.strftime("%H:%M:%S UTC")
     end
 
-    def redis_connection_and_namespace
-      @redis_connection_and_namespace ||= begin
-        namespace_suffix = namespace.nil? ? "" : "##{namespace}"
-        "#{redis_connection}#{namespace_suffix}"
-      end
+    def pollable?
+      !(current_path == "" || current_path.start_with?("metrics"))
     end
 
     def retry_or_delete_or_kill(job, params)

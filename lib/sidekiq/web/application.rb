@@ -20,6 +20,12 @@ module Sidekiq
       "worker-src 'self'",
       "base-uri 'self'"
     ].join("; ").freeze
+    METRICS_PERIODS = {
+      "1h" => 60,
+      "2h" => 120,
+      "4h" => 240,
+      "8h" => 480
+    }
 
     def initialize(klass)
       @klass = klass
@@ -60,17 +66,42 @@ module Sidekiq
       erb(:dashboard)
     end
 
+    get "/metrics" do
+      q = Sidekiq::Metrics::Query.new
+      @period = h((params[:period] || "")[0..1])
+      @periods = METRICS_PERIODS
+      minutes = @periods.fetch(@period, @periods.values.first)
+      @query_result = q.top_jobs(minutes: minutes)
+      erb(:metrics)
+    end
+
+    get "/metrics/:name" do
+      @name = route_params[:name]
+      @period = h((params[:period] || "")[0..1])
+      q = Sidekiq::Metrics::Query.new
+      @periods = METRICS_PERIODS
+      minutes = @periods.fetch(@period, @periods.values.first)
+      @query_result = q.for_job(@name, minutes: minutes)
+      erb(:metrics_for_job)
+    end
+
     get "/busy" do
+      @count = (params["count"] || 100).to_i
+      (@current_page, @total_size, @workset) = page_items(workset, params["page"], @count)
+
       erb(:busy)
     end
 
     post "/busy" do
       if params["identity"]
-        p = Sidekiq::Process.new("identity" => params["identity"])
-        p.quiet! if params["quiet"]
-        p.stop! if params["stop"]
+        pro = Sidekiq::ProcessSet[params["identity"]]
+
+        pro.quiet! if params["quiet"]
+        pro.stop! if params["stop"]
       else
         processes.each do |pro|
+          next if pro.embedded?
+
           pro.quiet! if params["quiet"]
           pro.stop! if params["stop"]
         end
@@ -294,12 +325,12 @@ module Sidekiq
     end
 
     get "/stats/queues" do
-      json Sidekiq::Stats::Queues.new.lengths
+      json Sidekiq::Stats.new.queues
     end
 
     def call(env)
       action = self.class.match(env)
-      return [404, {"Content-Type" => "text/plain", "X-Cascade" => "pass"}, ["Not Found"]] unless action
+      return [404, {"content-type" => "text/plain", "x-cascade" => "pass"}, ["Not Found"]] unless action
 
       app = @klass
       resp = catch(:halt) do
@@ -316,10 +347,10 @@ module Sidekiq
       else
         # rendered content goes here
         headers = {
-          "Content-Type" => "text/html",
-          "Cache-Control" => "private, no-store",
-          "Content-Language" => action.locale,
-          "Content-Security-Policy" => CSP_HEADER
+          "content-type" => "text/html",
+          "cache-control" => "private, no-store",
+          "content-language" => action.locale,
+          "content-security-policy" => CSP_HEADER
         }
         # we'll let Rack calculate Content-Length for us.
         [200, headers, [resp]]

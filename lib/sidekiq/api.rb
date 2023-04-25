@@ -3,9 +3,28 @@
 require "sidekiq"
 
 require "zlib"
+require "set"
 require "base64"
 
+require "sidekiq/metrics/query"
+
+#
+# Sidekiq's Data API provides a Ruby object model on top
+# of Sidekiq's runtime data in Redis. This API should never
+# be used within application code for business logic.
+#
+# The Sidekiq server process never uses this API: all data
+# manipulation is done directly for performance reasons to
+# ensure we are using Redis as efficiently as possible at
+# every callsite.
+#
+
 module Sidekiq
+  # Retrieve runtime statistics from Redis regarding
+  # this Sidekiq cluster.
+  #
+  #   stat = Sidekiq::Stats.new
+  #   stat.processed
   class Stats
     def initialize
       fetch_stats_fast!
@@ -48,10 +67,22 @@ module Sidekiq
     end
 
     def queues
-      Sidekiq::Stats::Queues.new.lengths
+      Sidekiq.redis do |conn|
+        queues = conn.sscan("queues").to_a
+
+        lengths = conn.pipelined { |pipeline|
+          queues.each do |queue|
+            pipeline.llen("queue:#{queue}")
+          end
+        }
+
+        array_of_arrays = queues.zip(lengths).sort_by { |_, size| -size }
+        array_of_arrays.to_h
+      end
     end
 
     # O(1) redis calls
+    # @api private
     def fetch_stats_fast!
       pipe1_res = Sidekiq.redis { |conn|
         conn.pipelined do |pipeline|
@@ -91,13 +122,14 @@ module Sidekiq
     end
 
     # O(number of processes + number of queues) redis calls
+    # @api private
     def fetch_stats_slow!
       processes = Sidekiq.redis { |conn|
-        conn.sscan_each("processes").to_a
+        conn.sscan("processes").to_a
       }
 
       queues = Sidekiq.redis { |conn|
-        conn.sscan_each("queues").to_a
+        conn.sscan("queues").to_a
       }
 
       pipe2_res = Sidekiq.redis { |conn|
@@ -109,18 +141,20 @@ module Sidekiq
 
       s = processes.size
       workers_size = pipe2_res[0...s].sum(&:to_i)
-      enqueued = pipe2_res[s..-1].sum(&:to_i)
+      enqueued = pipe2_res[s..].sum(&:to_i)
 
       @stats[:workers_size] = workers_size
       @stats[:enqueued] = enqueued
       @stats
     end
 
+    # @api private
     def fetch_stats!
       fetch_stats_fast!
       fetch_stats_slow!
     end
 
+    # @api private
     def reset(*stats)
       all = %w[failed processed]
       stats = stats.empty? ? all : all & stats.flatten.compact.map(&:to_s)
@@ -142,25 +176,8 @@ module Sidekiq
       @stats[s] || raise(ArgumentError, "Unknown stat #{s}")
     end
 
-    class Queues
-      def lengths
-        Sidekiq.redis do |conn|
-          queues = conn.sscan_each("queues").to_a
-
-          lengths = conn.pipelined { |pipeline|
-            queues.each do |queue|
-              pipeline.llen("queue:#{queue}")
-            end
-          }
-
-          array_of_arrays = queues.zip(lengths).sort_by { |_, size| -size }
-          array_of_arrays.to_h
-        end
-      end
-    end
-
     class History
-      def initialize(days_previous, start_date = nil)
+      def initialize(days_previous, start_date = nil, pool: nil)
         # we only store five years of data in Redis
         raise ArgumentError if days_previous < 1 || days_previous > (5 * 365)
         @days_previous = days_previous
@@ -185,15 +202,10 @@ module Sidekiq
 
         keys = dates.map { |datestr| "stat:#{stat}:#{datestr}" }
 
-        begin
-          Sidekiq.redis do |conn|
-            conn.mget(keys).each_with_index do |value, idx|
-              stat_hash[dates[idx]] = value ? value.to_i : 0
-            end
+        Sidekiq.redis do |conn|
+          conn.mget(keys).each_with_index do |value, idx|
+            stat_hash[dates[idx]] = value ? value.to_i : 0
           end
-        rescue RedisConnection.adapter::CommandError
-          # mget will trigger a CROSSSLOT error when run against a Cluster
-          # TODO Someone want to add Cluster support?
         end
 
         stat_hash
@@ -202,9 +214,10 @@ module Sidekiq
   end
 
   ##
-  # Encapsulates a queue within Sidekiq.
+  # Represents a queue within Sidekiq.
   # Allows enumeration of all jobs within the queue
-  # and deletion of jobs.
+  # and deletion of jobs. NB: this queue data is real-time
+  # and is changing within Redis moment by moment.
   #
   #   queue = Sidekiq::Queue.new("mailer")
   #   queue.each do |job|
@@ -212,7 +225,6 @@ module Sidekiq
   #     job.args # => [1, 2, 3]
   #     job.delete if job.jid == 'abcdef1234567890'
   #   end
-  #
   class Queue
     include Enumerable
 
@@ -221,7 +233,7 @@ module Sidekiq
     #
     # @return [Array<Sidekiq::Queue>]
     def self.all
-      Sidekiq.redis { |c| c.sscan_each("queues").to_a }.sort.map { |q| Sidekiq::Queue.new(q) }
+      Sidekiq.redis { |c| c.sscan("queues").to_a }.sort.map { |q| Sidekiq::Queue.new(q) }
     end
 
     attr_reader :name
@@ -296,41 +308,53 @@ module Sidekiq
     end
 
     # delete all jobs within this queue
+    # @return [Boolean] true
     def clear
       Sidekiq.redis do |conn|
         conn.multi do |transaction|
           transaction.unlink(@rname)
-          transaction.srem("queues", name)
+          transaction.srem("queues", [name])
         end
       end
+      true
     end
     alias_method :💣, :clear
 
-    def as_json(options = nil) # :nodoc:
+    # :nodoc:
+    # @api private
+    def as_json(options = nil)
       {name: name} # 5336
     end
   end
 
   ##
-  # Encapsulates a pending job within a Sidekiq queue or
-  # sorted set.
+  # Represents a pending job within a Sidekiq queue.
   #
   # The job should be considered immutable but may be
   # removed from the queue via JobRecord#delete.
-  #
   class JobRecord
+    # the parsed Hash of job data
+    # @!attribute [r] Item
     attr_reader :item
+    # the underlying String in Redis
+    # @!attribute [r] Value
     attr_reader :value
+    # the queue associated with this job
+    # @!attribute [r] Queue
     attr_reader :queue
 
-    def initialize(item, queue_name = nil) # :nodoc:
+    # :nodoc:
+    # @api private
+    def initialize(item, queue_name = nil)
       @args = nil
       @value = item
       @item = item.is_a?(Hash) ? item : parse(item)
       @queue = queue_name || @item["queue"]
     end
 
-    def parse(item) # :nodoc:
+    # :nodoc:
+    # @api private
+    def parse(item)
       Sidekiq.load_json(item)
     rescue JSON::ParserError
       # If the job payload in Redis is invalid JSON, we'll load
@@ -341,6 +365,8 @@ module Sidekiq
       {}
     end
 
+    # This is the job class which Sidekiq will execute. If using ActiveJob,
+    # this class will be the ActiveJob adapter class rather than a specific job.
     def klass
       self["class"]
     end
@@ -348,12 +374,7 @@ module Sidekiq
     def display_class
       # Unwrap known wrappers so they show up in a human-friendly manner in the Web UI
       @klass ||= self["display_class"] || begin
-        case klass
-        when /\ASidekiq::Extensions::Delayed/
-          safe_load(args[0], klass) do |target, method, _|
-            "#{target}.#{method}"
-          end
-        when "ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper"
+        if klass == "ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper"
           job_class = @item["wrapped"] || args[0]
           if job_class == "ActionMailer::DeliveryJob" || job_class == "ActionMailer::MailDeliveryJob"
             # MailerClass#mailer_method
@@ -369,16 +390,7 @@ module Sidekiq
 
     def display_args
       # Unwrap known wrappers so they show up in a human-friendly manner in the Web UI
-      @display_args ||= case klass
-      when /\ASidekiq::Extensions::Delayed/
-        safe_load(args[0], args) do |_, _, arg, kwarg|
-          if !kwarg || kwarg.empty?
-            arg
-          else
-            [arg, kwarg]
-          end
-        end
-      when "ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper"
+      @display_args ||= if klass == "ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper"
         job_args = self["wrapped"] ? args[0]["arguments"] : []
         if (self["wrapped"] || args[0]) == "ActionMailer::DeliveryJob"
           # remove MailerClass, mailer_method and 'deliver_now'
@@ -404,6 +416,10 @@ module Sidekiq
 
     def jid
       self["jid"]
+    end
+
+    def bid
+      self["bid"]
     end
 
     def enqueued_at
@@ -451,50 +467,35 @@ module Sidekiq
 
     private
 
-    def safe_load(content, default)
-      yield(*YAML.load(content))
-    rescue => ex
-      # #1761 in dev mode, it's possible to have jobs enqueued which haven't been loaded into
-      # memory yet so the YAML can't be loaded.
-      # TODO is this still necessary? Zeitwerk reloader should handle?
-      Sidekiq.logger.warn "Unable to load YAML: #{ex.message}" unless Sidekiq.config[:environment] == "development"
-      default
-    end
-
     def uncompress_backtrace(backtrace)
-      if backtrace.is_a?(Array)
-        # Handle old jobs with raw Array backtrace format
-        backtrace
-      else
-        decoded = Base64.decode64(backtrace)
-        uncompressed = Zlib::Inflate.inflate(decoded)
-        begin
-          Sidekiq.load_json(uncompressed)
-        rescue
-          # Handle old jobs with marshalled backtrace format
-          # TODO Remove in 7.x
-          Marshal.load(uncompressed)
-        end
-      end
+      decoded = Base64.decode64(backtrace)
+      uncompressed = Zlib::Inflate.inflate(decoded)
+      Sidekiq.load_json(uncompressed)
     end
   end
 
   # Represents a job within a Redis sorted set where the score
-  # represents a timestamp for the job.
+  # represents a timestamp associated with the job. This timestamp
+  # could be the scheduled time for it to run (e.g. scheduled set),
+  # or the expiration date after which the entry should be deleted (e.g. dead set).
   class SortedEntry < JobRecord
     attr_reader :score
     attr_reader :parent
 
-    def initialize(parent, score, item) # :nodoc:
+    # :nodoc:
+    # @api private
+    def initialize(parent, score, item)
       super(item)
       @score = Float(score)
       @parent = parent
     end
 
+    # The timestamp associated with this entry
     def at
       Time.at(score).utc
     end
 
+    # remove this entry from the sorted set
     def delete
       if @value
         @parent.delete_by_value(@parent.name, @value)
@@ -505,7 +506,7 @@ module Sidekiq
 
     # Change the scheduled time for this job.
     #
-    # @param [Time] the new timestamp when this job will be enqueued.
+    # @param at [Time] the new timestamp for this job
     def reschedule(at)
       Sidekiq.redis do |conn|
         conn.zincrby(@parent.name, at.to_f - @score, Sidekiq.dump_json(@item))
@@ -579,47 +580,69 @@ module Sidekiq
     end
   end
 
+  # Base class for all sorted sets within Sidekiq.
   class SortedSet
     include Enumerable
 
+    # Redis key of the set
+    # @!attribute [r] Name
     attr_reader :name
 
+    # :nodoc:
+    # @api private
     def initialize(name)
       @name = name
       @_size = size
     end
 
+    # real-time size of the set, will change
     def size
       Sidekiq.redis { |c| c.zcard(name) }
     end
 
+    # Scan through each element of the sorted set, yielding each to the supplied block.
+    # Please see Redis's <a href="https://redis.io/commands/scan/">SCAN documentation</a> for implementation details.
+    #
+    # @param match [String] a snippet or regexp to filter matches.
+    # @param count [Integer] number of elements to retrieve at a time, default 100
+    # @yieldparam [Sidekiq::SortedEntry] each entry
     def scan(match, count = 100)
       return to_enum(:scan, match, count) unless block_given?
 
       match = "*#{match}*" unless match.include?("*")
       Sidekiq.redis do |conn|
-        conn.zscan_each(name, match: match, count: count) do |entry, score|
+        conn.zscan(name, match: match, count: count) do |entry, score|
           yield SortedEntry.new(self, score, entry)
         end
       end
     end
 
+    # @return [Boolean] always true
     def clear
       Sidekiq.redis do |conn|
         conn.unlink(name)
       end
+      true
     end
     alias_method :💣, :clear
 
-    def as_json(options = nil) # :nodoc:
+    # :nodoc:
+    # @api private
+    def as_json(options = nil)
       {name: name} # 5336
     end
   end
 
+  # Base class for all sorted sets which contain jobs, e.g. scheduled, retry and dead.
+  # Sidekiq Pro and Enterprise add additional sorted sets which do not contain job data,
+  # e.g. Batches.
   class JobSet < SortedSet
-    def schedule(timestamp, message)
+    # Add a job with the associated timestamp to this set.
+    # @param timestamp [Time] the score for the job
+    # @param job [Hash] the job data
+    def schedule(timestamp, job)
       Sidekiq.redis do |conn|
-        conn.zadd(name, timestamp.to_f.to_s, Sidekiq.dump_json(message))
+        conn.zadd(name, timestamp.to_f.to_s, Sidekiq.dump_json(job))
       end
     end
 
@@ -647,6 +670,10 @@ module Sidekiq
     ##
     # Fetch jobs that match a given time or Range. Job ID is an
     # optional second argument.
+    #
+    # @param score [Time,Range] a specific timestamp or range
+    # @param jid [String, optional] find a specific JID within the score
+    # @return [Array<SortedEntry>] any results found, can be empty
     def fetch(score, jid = nil)
       begin_score, end_score =
         if score.is_a?(Range)
@@ -668,11 +695,14 @@ module Sidekiq
 
     ##
     # Find the job with the given JID within this sorted set.
-    # This is a slower O(n) operation.  Do not use for app logic.
+    # *This is a slow O(n) operation*.  Do not use for app logic.
+    #
+    # @param jid [String] the job identifier
+    # @return [SortedEntry] the record or nil
     def find_job(jid)
       Sidekiq.redis do |conn|
-        conn.zscan_each(name, match: "*#{jid}*", count: 100) do |entry, score|
-          job = JSON.parse(entry)
+        conn.zscan(name, match: "*#{jid}*", count: 100) do |entry, score|
+          job = Sidekiq.load_json(entry)
           matched = job["jid"] == jid
           return SortedEntry.new(self, score, entry) if matched
         end
@@ -680,6 +710,8 @@ module Sidekiq
       nil
     end
 
+    # :nodoc:
+    # @api private
     def delete_by_value(name, value)
       Sidekiq.redis do |conn|
         ret = conn.zrem(name, value)
@@ -688,6 +720,8 @@ module Sidekiq
       end
     end
 
+    # :nodoc:
+    # @api private
     def delete_by_jid(score, jid)
       Sidekiq.redis do |conn|
         elements = conn.zrangebyscore(name, score, score)
@@ -708,17 +742,13 @@ module Sidekiq
   end
 
   ##
-  # Allows enumeration of scheduled jobs within Sidekiq.
+  # The set of scheduled jobs within Sidekiq.
   # Based on this, you can search/filter for jobs.  Here's an
-  # example where I'm selecting all jobs of a certain type
-  # and deleting them from the schedule queue.
+  # example where I'm selecting jobs based on some complex logic
+  # and deleting them from the scheduled set.
   #
-  #   r = Sidekiq::ScheduledSet.new
-  #   r.select do |scheduled|
-  #     scheduled.klass == 'Sidekiq::Extensions::DelayedClass' &&
-  #     scheduled.args[0] == 'User' &&
-  #     scheduled.args[1] == 'setup_new_subscriber'
-  #   end.map(&:delete)
+  # See the API wiki page for usage notes and examples.
+  #
   class ScheduledSet < JobSet
     def initialize
       super "schedule"
@@ -726,46 +756,48 @@ module Sidekiq
   end
 
   ##
-  # Allows enumeration of retries within Sidekiq.
+  # The set of retries within Sidekiq.
   # Based on this, you can search/filter for jobs.  Here's an
   # example where I'm selecting all jobs of a certain type
   # and deleting them from the retry queue.
   #
-  #   r = Sidekiq::RetrySet.new
-  #   r.select do |retri|
-  #     retri.klass == 'Sidekiq::Extensions::DelayedClass' &&
-  #     retri.args[0] == 'User' &&
-  #     retri.args[1] == 'setup_new_subscriber'
-  #   end.map(&:delete)
+  # See the API wiki page for usage notes and examples.
+  #
   class RetrySet < JobSet
     def initialize
       super "retry"
     end
 
+    # Enqueues all jobs pending within the retry set.
     def retry_all
       each(&:retry) while size > 0
     end
 
+    # Kills all jobs pending within the retry set.
     def kill_all
       each(&:kill) while size > 0
     end
   end
 
   ##
-  # Allows enumeration of dead jobs within Sidekiq.
+  # The set of dead jobs within Sidekiq. Dead jobs have failed all of
+  # their retries and are helding in this set pending some sort of manual
+  # fix. They will be removed after 6 months (dead_timeout) if not.
   #
   class DeadSet < JobSet
     def initialize
       super "dead"
     end
 
+    # Add the given job to the Dead set.
+    # @param message [String] the job data as JSON
     def kill(message, opts = {})
       now = Time.now.to_f
       Sidekiq.redis do |conn|
         conn.multi do |transaction|
           transaction.zadd(name, now.to_s, message)
-          transaction.zremrangebyscore(name, "-inf", now - self.class.timeout)
-          transaction.zremrangebyrank(name, 0, - self.class.max_jobs)
+          transaction.zremrangebyscore(name, "-inf", now - Sidekiq::Config::DEFAULTS[:dead_timeout_in_seconds])
+          transaction.zremrangebyrank(name, 0, - Sidekiq::Config::DEFAULTS[:dead_max_jobs])
         end
       end
 
@@ -773,23 +805,16 @@ module Sidekiq
         job = Sidekiq.load_json(message)
         r = RuntimeError.new("Job killed by API")
         r.set_backtrace(caller)
-        Sidekiq.death_handlers.each do |handle|
+        Sidekiq.default_configuration.death_handlers.each do |handle|
           handle.call(job, r)
         end
       end
       true
     end
 
+    # Enqueue all dead jobs
     def retry_all
       each(&:retry) while size > 0
-    end
-
-    def self.max_jobs
-      Sidekiq[:dead_max_jobs]
-    end
-
-    def self.timeout
-      Sidekiq[:dead_timeout_in_seconds]
     end
   end
 
@@ -798,21 +823,46 @@ module Sidekiq
   # right now.  Each process sends a heartbeat to Redis every 5 seconds
   # so this set should be relatively accurate, barring network partitions.
   #
-  # Yields a Sidekiq::Process.
+  # @yieldparam [Sidekiq::Process]
   #
   class ProcessSet
     include Enumerable
 
+    def self.[](identity)
+      exists, (info, busy, beat, quiet, rss, rtt_us) = Sidekiq.redis { |conn|
+        conn.multi { |transaction|
+          transaction.sismember("processes", identity)
+          transaction.hmget(identity, "info", "busy", "beat", "quiet", "rss", "rtt_us")
+        }
+      }
+
+      return nil if exists == 0 || info.nil?
+
+      hash = Sidekiq.load_json(info)
+      Process.new(hash.merge("busy" => busy.to_i,
+        "beat" => beat.to_f,
+        "quiet" => quiet,
+        "rss" => rss.to_i,
+        "rtt_us" => rtt_us.to_i))
+    end
+
+    # :nodoc:
+    # @api private
     def initialize(clean_plz = true)
       cleanup if clean_plz
     end
 
     # Cleans up dead processes recorded in Redis.
     # Returns the number of processes cleaned.
+    # :nodoc:
+    # @api private
     def cleanup
+      # dont run cleanup more than once per minute
+      return 0 unless Sidekiq.redis { |conn| conn.set("process_cleanup", "1", nx: true, ex: 60) }
+
       count = 0
       Sidekiq.redis do |conn|
-        procs = conn.sscan_each("processes").to_a.sort
+        procs = conn.sscan("processes").to_a
         heartbeats = conn.pipelined { |pipeline|
           procs.each do |key|
             pipeline.hget(key, "info")
@@ -832,7 +882,7 @@ module Sidekiq
 
     def each
       result = Sidekiq.redis { |conn|
-        procs = conn.sscan_each("processes").to_a.sort
+        procs = conn.sscan("processes").to_a.sort
 
         # We're making a tradeoff here between consuming more memory instead of
         # making more roundtrips to Redis, but if you have hundreds or thousands of workers,
@@ -844,7 +894,7 @@ module Sidekiq
         end
       }
 
-      result.each do |info, busy, at_s, quiet, rss, rtt|
+      result.each do |info, busy, beat, quiet, rss, rtt_us|
         # If a process is stopped between when we query Redis for `procs` and
         # when we query for `result`, we will have an item in `result` that is
         # composed of `nil` values.
@@ -852,10 +902,10 @@ module Sidekiq
 
         hash = Sidekiq.load_json(info)
         yield Process.new(hash.merge("busy" => busy.to_i,
-          "beat" => at_s.to_f,
+          "beat" => beat.to_f,
           "quiet" => quiet,
           "rss" => rss.to_i,
-          "rtt_us" => rtt.to_i))
+          "rtt_us" => rtt_us.to_i))
       end
     end
 
@@ -863,6 +913,7 @@ module Sidekiq
     # based on current heartbeat.  #each does that and ensures the set only
     # contains Sidekiq processes which have sent a heartbeat within the last
     # 60 seconds.
+    # @return [Integer] current number of registered Sidekiq processes
     def size
       Sidekiq.redis { |conn| conn.scard("processes") }
     end
@@ -870,10 +921,12 @@ module Sidekiq
     # Total number of threads available to execute jobs.
     # For Sidekiq Enterprise customers this number (in production) must be
     # less than or equal to your licensed concurrency.
+    # @return [Integer] the sum of process concurrency
     def total_concurrency
       sum { |x| x["concurrency"].to_i }
     end
 
+    # @return [Integer] total amount of RSS memory consumed by Sidekiq processes
     def total_rss_in_kb
       sum { |x| x["rss"].to_i }
     end
@@ -882,6 +935,8 @@ module Sidekiq
     # Returns the identity of the current cluster leader or "" if no leader.
     # This is a Sidekiq Enterprise feature, will always return "" in Sidekiq
     # or Sidekiq Pro.
+    # @return [String] Identity of cluster leader
+    # @return [String] empty string if no leader
     def leader
       @leader ||= begin
         x = Sidekiq.redis { |c| c.get("dear-leader") }
@@ -906,8 +961,11 @@ module Sidekiq
   #   'busy' => 10,
   #   'beat' => <last heartbeat>,
   #   'identity' => <unique string identifying the process>,
+  #   'embedded' => true,
   # }
   class Process
+    # :nodoc:
+    # @api private
     def initialize(hash)
       @attribs = hash
     end
@@ -917,7 +975,7 @@ module Sidekiq
     end
 
     def labels
-      Array(self["labels"])
+      self["labels"].to_a
     end
 
     def [](key)
@@ -932,18 +990,47 @@ module Sidekiq
       self["queues"]
     end
 
+    def weights
+      self["weights"]
+    end
+
+    def version
+      self["version"]
+    end
+
+    def embedded?
+      self["embedded"]
+    end
+
+    # Signal this process to stop processing new jobs.
+    # It will continue to execute jobs it has already fetched.
+    # This method is *asynchronous* and it can take 5-10
+    # seconds for the process to quiet.
     def quiet!
+      raise "Can't quiet an embedded process" if embedded?
+
       signal("TSTP")
     end
 
+    # Signal this process to shutdown.
+    # It will shutdown within its configured :timeout value, default 25 seconds.
+    # This method is *asynchronous* and it can take 5-10
+    # seconds for the process to start shutting down.
     def stop!
+      raise "Can't stop an embedded process" if embedded?
+
       signal("TERM")
     end
 
+    # Signal this process to log backtraces for all threads.
+    # Useful if you have a frozen or deadlocked process which is
+    # still sending a heartbeat.
+    # This method is *asynchronous* and it can take 5-10 seconds.
     def dump_threads
       signal("TTIN")
     end
 
+    # @return [Boolean] true if this process is quiet or shutting down
     def stopping?
       self["quiet"] == "true"
     end
@@ -986,21 +1073,21 @@ module Sidekiq
 
     def each(&block)
       results = []
+      procs = nil
+      all_works = nil
+
       Sidekiq.redis do |conn|
-        procs = conn.sscan_each("processes").to_a
-        procs.sort.each do |key|
-          valid, workers = conn.pipelined { |pipeline|
-            pipeline.exists?(key)
+        procs = conn.sscan("processes").to_a.sort
+        all_works = conn.pipelined do |pipeline|
+          procs.each do |key|
             pipeline.hgetall("#{key}:work")
-          }
-          next unless valid
-          workers.each_pair do |tid, json|
-            hsh = Sidekiq.load_json(json)
-            p = hsh["payload"]
-            # avoid breaking API, this is a side effect of the JSON optimization in #4316
-            hsh["payload"] = Sidekiq.load_json(p) if p.is_a?(String)
-            results << [key, tid, hsh]
           end
+        end
+      end
+
+      procs.zip(all_works).each do |key, workers|
+        workers.each_pair do |tid, json|
+          results << [key, tid, Sidekiq.load_json(json)] unless json.empty?
         end
       end
 
@@ -1015,7 +1102,7 @@ module Sidekiq
     # which can easily get out of sync with crashy processes.
     def size
       Sidekiq.redis do |conn|
-        procs = conn.sscan_each("processes").to_a
+        procs = conn.sscan("processes").to_a
         if procs.empty?
           0
         else

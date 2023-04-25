@@ -3,7 +3,7 @@
 module Sidekiq
   module Paginator
     def page(key, pageidx = 1, page_size = 25, opts = nil)
-      current_page = pageidx.to_i < 1 ? 1 : pageidx.to_i
+      current_page = (pageidx.to_i < 1) ? 1 : pageidx.to_i
       pageidx = current_page - 1
       total_size = 0
       items = []
@@ -42,6 +42,14 @@ module Sidekiq
           raise "can't page a #{type}"
         end
       end
+    end
+
+    def page_items(items, pageidx = 1, page_size = 25)
+      current_page = (pageidx.to_i < 1) ? 1 : pageidx.to_i
+      pageidx = current_page - 1
+      starting = pageidx * page_size
+      items = items.to_a
+      [current_page, items.size, items[starting, page_size]]
     end
   end
 end

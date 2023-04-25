@@ -1,34 +1,19 @@
 require "bundler/gem_tasks"
 require "rake/testtask"
 require "standard/rake"
-require "rdoc/task"
 
-RDoc::Task.new do |rdoc|
-  rdoc.main = "docs/rdoc.rdoc"
-  rdoc.rdoc_files.include("docs/rdoc.rdoc",
-    "lib/sidekiq/api.rb",
-    "lib/sidekiq/client.rb",
-    "lib/sidekiq/worker.rb",
-    "lib/sidekiq/job.rb")
-end
+# If you want to generate API docs:
+#   gem install yard && yard && open doc/index.html
+# YARD readme: https://rubydoc.info/gems/yard/file/README.md
+# YARD tags: https://www.rubydoc.info/gems/yard/file/docs/Tags.md
+# YARD cheatsheet: https://gist.github.com/phansch/db18a595d2f5f1ef16646af72fe1fb0e
+
+# To check code coverage, include simplecov in the Gemfile and
+# run `COVERAGE=1 bundle exec rake`
 
 Rake::TestTask.new(:test) do |test|
   test.warning = true
-  test.pattern = "test/**/test_*.rb"
+  test.pattern = "test/**/*.rb"
 end
 
-namespace :test do
-  task :redis_client do
-    previous = ENV["SIDEKIQ_REDIS_CLIENT"]
-    ENV["SIDEKIQ_REDIS_CLIENT"] = "1"
-    Rake::Task[:test].execute
-  ensure
-    if previous
-      ENV["SIDEKIQ_REDIS_CLIENT"] = previous
-    else
-      ENV.delete("SIDEKIQ_REDIS_CLIENT")
-    end
-  end
-end
-
-task default: [:standard, :test, "test:redis_client"]
+task default: [:standard, :test]

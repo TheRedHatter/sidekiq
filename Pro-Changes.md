@@ -1,8 +1,96 @@
 # Sidekiq Pro Changelog
 
-[Sidekiq Changes](https://github.com/mperham/sidekiq/blob/main/Changes.md) | [Sidekiq Pro Changes](https://github.com/mperham/sidekiq/blob/main/Pro-Changes.md) | [Sidekiq Enterprise Changes](https://github.com/mperham/sidekiq/blob/main/Ent-Changes.md)
+[Sidekiq Changes](https://github.com/sidekiq/sidekiq/blob/main/Changes.md) | [Sidekiq Pro Changes](https://github.com/sidekiq/sidekiq/blob/main/Pro-Changes.md) | [Sidekiq Enterprise Changes](https://github.com/sidekiq/sidekiq/blob/main/Ent-Changes.md)
 
 Please see [sidekiq.org](https://sidekiq.org/) for more details and how to buy.
+
+7.0.10
+---------
+
+- Increase fetch timeout to minimize ReadTimeoutError [#5874]
+- Add Hindi locale [gaurish]
+
+7.0.9
+---------
+
+- Dead JIDs on the Batch page are now linked so you can quickly jump to them in Dead
+- Fix unnecessary Redis pool creation [#5830]
+- Fix network logic which could have resulted in pause/unpause not working [#5834]
+
+7.0.8
+---------
+
+- Fix redis-client API usage which could result in stuck Redis connections [#5823]
+
+7.0.7
+---------
+
+- Add Farsi translations
+- Fix death callback firing multiple times per batch [#5740]
+
+7.0.6
+---------
+
+- Fix random fetching with super_fetch [#5726]
+- Fix config issue with reliable_push [#5698]
+
+7.0.4, 7.0.5
+---------
+
+- Fixes for the `pending` fix [#5689]
+
+7.0.3
+---------
+
+- Adjust statsd middleware to not hold an open connection while executing a job [#5684]
+
+7.0.2
+---------
+
+- Clamp Batch `pending` to 0 [#5659]
+- Drop Batch pub/sub feature [#5645]
+
+7.0.1
+---------
+
+- Fix eager connection to Redis when activating reliable_push [#5606]
+
+7.0.0
+---------
+
+- Componentize and capsulize Pro functionality for Sidekiq 7.
+- Add DE locale
+
+5.5.7, 5.5.8
+---------
+
+- Fix typo in `pending` fix [#5689]
+
+5.5.6
+---------
+
+- Clamp Batch `pending` to 0 [#5659]
+
+5.5.5
+---------
+
+- Lock Sidekiq Pro 5.x to Sidekiq 6.x.
+- Update IT localization
+
+5.5.4
+---------
+
+- Fix batch "pending == -1" race condition [#5524]
+
+5.5.3
+---------
+
+- Remove Redis 4.8.0 deprecation warnings
+
+5.5.2
+---------
+
+- Fix overly aggressive orphan check with large Sidekiq clusters [#5435]
 
 5.5.1
 ---------
@@ -118,14 +206,14 @@ job.WorkerName.failure -> job.failure with tag worker:WorkerName
 
 - There is no significant migration from Sidekiq Pro 4.0 to 5.0
   but make sure you read the [update notes for Sidekiq
-6.0](https://github.com/mperham/sidekiq/blob/master/6.0-Upgrade.md).
+6.0](https://github.com/sidekiq/sidekiq/blob/main/docs/6.0-Upgrade.md).
 - Removed various deprecated APIs and associated warnings.
 - **BREAKING CHANGE** Remove the `Sidekiq::Batch::Status#dead_jobs` API in favor of
   `Sidekiq::Batch::Status#dead_jids`. [#4217]
 - Update Sidekiq Pro codebase to use StandardRB formatting
 - Fix lingering "b-XXX-died" elements in Redis which could cause
   excessive memory usage. [#4217]
-- Add ES translations, see issues [#3949](https://github.com/mperham/sidekiq/issues/3949) and [#3951](https://github.com/mperham/sidekiq/issues/3951) to add your own language.
+- Add ES translations, see issues [#3949](https://github.com/sidekiq/sidekiq/issues/3949) and [#3951](https://github.com/sidekiq/sidekiq/issues/3951) to add your own language.
 
 4.0.5
 ---------
@@ -168,7 +256,7 @@ batch.on(:death, ...)
 4.0.0
 ---------
 
-- See the [Sidekiq Pro 4.0](Pro-4.0-Upgrade.md) release notes.
+- See the [Sidekiq Pro 4.0](docs/Pro-4.0-Upgrade.md) release notes.
 
 
 3.7.1
@@ -370,7 +458,7 @@ end
 ---------
 
 - New container-friendly fetch algorithm: `timed_fetch`.  See the
-  [wiki documentation](https://github.com/mperham/sidekiq/wiki/Pro-Reliability-Server)
+  [wiki documentation](https://github.com/sidekiq/sidekiq/wiki/Pro-Reliability-Server)
   for trade offs between the two reliability options.  You should
   use this if you are on Heroku, Docker, Amazon ECS or EBS or
   another container-based system.
@@ -413,7 +501,7 @@ end
 3.0.0
 -----------
 
-- See the [Pro 3.0 release notes](Pro-3.0-Upgrade.md).
+- See the [Pro 3.0 release notes](docs/Pro-3.0-Upgrade.md).
 
 2.1.3
 -----------
@@ -507,7 +595,7 @@ mount Sidekiq::Pro::Web.with(redis_pool: POOL2), at: '/sidekiq2', as: 'sidekiq2'
 2.0.0
 -----------
 
-- See [the Upgrade Notes](Pro-2.0-Upgrade.md) for detailed notes.
+- See [the Upgrade Notes](docs/Pro-2.0-Upgrade.md) for detailed notes.
 
 1.9.2
 -----------

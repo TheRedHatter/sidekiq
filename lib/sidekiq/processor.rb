@@ -26,18 +26,18 @@ module Sidekiq
 
     attr_reader :thread
     attr_reader :job
+    attr_reader :capsule
 
-    def initialize(options, &block)
+    def initialize(capsule, &block)
+      @config = @capsule = capsule
       @callback = block
       @down = false
       @done = false
       @job = nil
       @thread = nil
-      @config = options
-      @strategy = options[:fetch]
-      @reloader = options[:reloader] || proc { |&block| block.call }
-      @job_logger = (options[:job_logger] || Sidekiq::JobLogger).new
-      @retrier = Sidekiq::JobRetry.new(options)
+      @reloader = Sidekiq.default_configuration[:reloader]
+      @job_logger = (capsule.config[:job_logger] || Sidekiq::JobLogger).new(logger)
+      @retrier = Sidekiq::JobRetry.new(capsule)
     end
 
     def terminate(wait = false)
@@ -59,12 +59,16 @@ module Sidekiq
     end
 
     def start
-      @thread ||= safe_thread("processor", &method(:run))
+      @thread ||= safe_thread("#{config.name}/processor", &method(:run))
     end
 
     private unless $TESTING
 
     def run
+      # By setting this thread-local, Sidekiq.redis will access +Sidekiq::Capsule#redis_pool+
+      # instead of the global pool in +Sidekiq::Config#redis_pool+.
+      Thread.current[:sidekiq_capsule] = @capsule
+
       process_one until @done
       @callback.call(self)
     rescue Sidekiq::Shutdown
@@ -80,7 +84,7 @@ module Sidekiq
     end
 
     def get_one
-      uow = @strategy.retrieve_work
+      uow = capsule.fetcher.retrieve_work
       if @down
         logger.info { "Redis is online, #{::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - @down} sec downtime" }
         @down = nil
@@ -129,7 +133,7 @@ module Sidekiq
               # the Reloader.  It handles code loading, db connection management, etc.
               # Effectively this block denotes a "unit of work" to Rails.
               @reloader.call do
-                klass = constantize(job_hash["class"])
+                klass = Object.const_get(job_hash["class"])
                 inst = klass.new
                 inst.jid = job_hash["jid"]
                 @retrier.local(inst, jobstr, queue) do
@@ -142,6 +146,9 @@ module Sidekiq
       end
     end
 
+    IGNORE_SHUTDOWN_INTERRUPTS = {Sidekiq::Shutdown => :never}
+    private_constant :IGNORE_SHUTDOWN_INTERRUPTS
+
     def process(uow)
       jobstr = uow.job
       queue = uow.queue_name
@@ -152,15 +159,21 @@ module Sidekiq
         job_hash = Sidekiq.load_json(jobstr)
       rescue => ex
         handle_exception(ex, {context: "Invalid JSON for job", jobstr: jobstr})
-        # we can't notify because the job isn't a valid hash payload.
-        DeadSet.new.kill(jobstr, notify_failure: false)
+        now = Time.now.to_f
+        redis do |conn|
+          conn.multi do |xa|
+            xa.zadd("dead", now.to_s, jobstr)
+            xa.zremrangebyscore("dead", "-inf", now - @capsule.config[:dead_timeout_in_seconds])
+            xa.zremrangebyrank("dead", 0, - @capsule.config[:dead_max_jobs])
+          end
+        end
         return uow.acknowledge
       end
 
       ack = false
       begin
         dispatch(job_hash, queue, jobstr) do |inst|
-          @config.server_middleware.invoke(inst, job_hash, queue) do
+          config.server_middleware.invoke(inst, job_hash, queue) do
             execute_job(inst, job_hash["args"])
           end
         end
@@ -174,7 +187,7 @@ module Sidekiq
         # signals that we created a retry successfully.  We can acknowlege the job.
         ack = true
         e = h.cause || h
-        handle_exception(e, {context: "Job raised exception", job: job_hash, jobstr: jobstr})
+        handle_exception(e, {context: "Job raised exception", job: job_hash})
         raise e
       rescue Exception => ex
         # Unexpected error!  This is very bad and indicates an exception that got past
@@ -185,7 +198,7 @@ module Sidekiq
       ensure
         if ack
           # We don't want a shutdown signal to interrupt job acknowledgment.
-          Thread.handle_interrupt(Sidekiq::Shutdown => :never) do
+          Thread.handle_interrupt(IGNORE_SHUTDOWN_INTERRUPTS) do
             uow.acknowledge
           end
         end
@@ -261,19 +274,6 @@ module Sidekiq
       ensure
         WORK_STATE.delete(tid)
         PROCESSED.incr
-      end
-    end
-
-    def constantize(str)
-      return Object.const_get(str) unless str.include?("::")
-
-      names = str.split("::")
-      names.shift if names.empty? || names.first.empty?
-
-      names.inject(Object) do |constant, name|
-        # the false flag limits search for name to under the constant namespace
-        #   which mimics Rails' behaviour
-        constant.const_get(name, false)
       end
     end
   end

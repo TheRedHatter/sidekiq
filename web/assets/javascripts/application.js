@@ -31,6 +31,7 @@ function addListeners() {
     node.addEventListener("click", addDataToggleListeners)
   })
 
+  addShiftClickListeners()
   updateFuzzyTimes();
   setLivePollFromUrl();
 
@@ -63,12 +64,29 @@ function addPollingListeners(_event)  {
 function addDataToggleListeners(event) {
   var source = event.target || event.srcElement;
   var targName = source.getAttribute("data-toggle");
-  var full = document.getElementById(targName + "_full");
+  var full = document.getElementById(targName);
   if (full.style.display == "block") {
     full.style.display = 'none';
   } else {
     full.style.display = 'block';
   }
+}
+
+function addShiftClickListeners() {
+  let checkboxes = Array.from(document.querySelectorAll(".shift_clickable"));
+  let lastChecked = null;
+  checkboxes.forEach(checkbox => {
+    checkbox.addEventListener("click", (e) => {
+      if (e.shiftKey && lastChecked) {
+        let myIndex = checkboxes.indexOf(checkbox);
+        let lastIndex = checkboxes.indexOf(lastChecked);
+        let [min, max] = [myIndex, lastIndex].sort();
+        let newState = checkbox.checked;
+        checkboxes.slice(min, max).forEach(c => c.checked = newState);
+      }
+      lastChecked = checkbox;
+    });
+  });
 }
 
 function updateFuzzyTimes() {

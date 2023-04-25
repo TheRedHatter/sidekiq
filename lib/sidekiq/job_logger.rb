@@ -2,7 +2,7 @@
 
 module Sidekiq
   class JobLogger
-    def initialize(logger = Sidekiq.logger)
+    def initialize(logger)
       @logger = logger
     end
 
@@ -33,7 +33,7 @@ module Sidekiq
 
       Thread.current[:sidekiq_context] = h
       level = job_hash["log_level"]
-      if level
+      if level && @logger.respond_to?(:log_at)
         @logger.log_at(level, &block)
       else
         yield
